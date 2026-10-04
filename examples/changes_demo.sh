@@ -109,4 +109,38 @@ else
   echo "（首屏已读完全部窗口，可自行加大数据量后重试本步）"
 fi
 
+echo; echo "== 10. 大量彼此无关的地层已登记后，一次局部断言变更 =="
+echo "-- 注册 60 个互不相关地层，并为相邻地层各铺一条互不相连的既存证据 --"
+for i in $(seq -w 1 60); do
+  curl -s -X POST "$BASE/strata" -H 'Content-Type: application/json' \
+    -d "{\"stratum_id\": \"BULK$i\", \"site\": \"变化追踪性能示例\"}" > /dev/null
+done
+REV=$(curl -s "$BASE/revision" | jget "['revision']")
+OPS=""
+for i in 1 3 5 7 9; do
+  j=$(printf '%02d' "$i"); k=$(printf '%02d' "$((i+1))")
+  OPS="$OPS{\"op\": \"assert\", \"evidence_id\": \"BULK-E$j\", \"stratum_a\": \"BULK$j\", \"stratum_b\": \"BULK$k\", \"relation\": \"same_period\"},"
+done
+OPS="${OPS%,}"
+curl -s -X POST "$BASE/batches" -H 'Content-Type: application/json' \
+  -d "{\"expected_revision\": $REV, \"operations\": [$OPS]}" | pp
+echo "-- 再做一次局部变更：只新增 BULK01 早于 BULK03 一条断言 --"
+REV=$(curl -s "$BASE/revision" | jget "['revision']")
+curl -s -X POST "$BASE/batches" -H 'Content-Type: application/json' -d "{
+  \"expected_revision\": $REV,
+  \"operations\": [
+    {\"op\": \"assert\", \"evidence_id\": \"BULK-LOCAL\", \"stratum_a\": \"BULK01\", \"stratum_b\": \"BULK03\", \"relation\": \"earlier_than\"}
+  ]}" | pp
+echo "-> 响应格式不变（relation_changes 为实际变化对数）；服务端只精算与该变更"
+echo "   前后可达性相关的候选地层对，其余 1700+ 对不再逐对重算（口径与全量逐对一致）。"
+echo "-- 读取本修订的变化记录（按 bound 过滤最新修订）："
+curl -s "$BASE/revision-changes?limit=1000" | python3 -c "
+import sys, json
+body = json.load(sys.stdin)
+last = max(c['revision'] for c in body['changes'])
+rows = [c for c in body['changes'] if c['revision'] == last]
+print(json.dumps({'revision': last, 'change_count': len(rows),
+                  'pairs': sorted((c['stratum_a'], c['stratum_b']) for c in rows)},
+                 ensure_ascii=False, indent=2))"
+
 echo; echo "全部示例执行完毕。"

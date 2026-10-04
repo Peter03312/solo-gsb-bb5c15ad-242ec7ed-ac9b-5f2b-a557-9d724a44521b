@@ -16,51 +16,200 @@
 撤回的证据在旧侧仍按当时生效解释（提交时刻已能拿到完整的当时断言集，无需
 回放后来的撤回）。服务启动时对部署前已存在的历史修订做幂等回填，使“已有
 历史修订也应可追溯”。
+
+变化计算（性能口径）：一次局部断言变更不再对全库地层逐对重算。先依据提交
+前后生效断言集的差异定位**候选地层对**——每条新增 / 撤回证据在其存在的一侧，
+取其“可到达起点”与“终点可到达”两个锥集的笛卡尔积（同期边正反两弧、沿同期
+关系无向扩散，覆盖同期合并 / 拆分；早于边按方向取锥，覆盖路径改道）；再仅对
+候选对调用 Derivation 精算关系与最优路径。候选之外的对前/后走法集合完全相同，
+结论与最优路径必不变（证明见 :func:`_candidate_pairs`）。实际变化很多（长链
+接入、整类合并）时候选自然增大，工作量随真实变化规模增长。普通批次、推演
+并入、野外包汇入与勘误、启动历史回填共用同一口径，记录结果与逐对算法逐条一致。
 """
 from __future__ import annotations
 
 import base64
 import json
-from typing import Any, Dict, List, Optional, Sequence
+from collections import defaultdict
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from psycopg2.extras import Json
 
-from .derivation import Assertion, Derivation, RELATION_LABELS
+from .derivation import Assertion, Derivation, RELATION_LABELS, SAME
 from .errors import ApiError
 
 
 # ------------------------------------------------------------------ 差异计算
+def _assertion_index(assertions: Sequence[Assertion]) -> Dict[str, Assertion]:
+    return {a.evidence_id: a for a in assertions}
+
+
+def _changed_assertions(
+    before: Sequence[Assertion], after: Sequence[Assertion]
+) -> List[Tuple[Optional[Assertion], Optional[Assertion]]]:
+    """提交前后生效断言集中发生变化的证据（新增 / 撤回；防御性也覆盖改端点/关系）。
+
+    断言只增不删、撤回仅置状态，正常情况下同一证据编号两侧至多一侧缺失；
+    这里以整条 Assertion 是否相等为准，任何字段变化都视为该证据“两侧不同”。
+    """
+    before_by_id = _assertion_index(before)
+    after_by_id = _assertion_index(after)
+    out: List[Tuple[Optional[Assertion], Optional[Assertion]]] = []
+    for evidence_id in sorted(set(before_by_id) | set(after_by_id)):
+        old = before_by_id.get(evidence_id)
+        new = after_by_id.get(evidence_id)
+        if old != new:
+            out.append((old, new))
+    return out
+
+
+def _mixed_graph(assertions: Sequence[Assertion]) -> Tuple[Dict[str, Set[str]], Dict[str, Set[str]]]:
+    """“同一期 + 早于”混合图的正向与逆向邻接（只看连通方向，不看证据编号）。
+
+    同一期边无向（两侧登记），早于边按 a -> b 登记；所有断言端点都建空集，
+    使孤立端点同样可作锥集种子。
+    """
+    adj: Dict[str, Set[str]] = defaultdict(set)
+    rev: Dict[str, Set[str]] = defaultdict(set)
+    for a in assertions:
+        adj.setdefault(a.a, set())
+        adj.setdefault(a.b, set())
+        rev.setdefault(a.a, set())
+        rev.setdefault(a.b, set())
+        if a.relation == SAME:
+            adj[a.a].add(a.b)
+            adj[a.b].add(a.a)
+            rev[a.a].add(a.b)
+            rev[a.b].add(a.a)
+        else:  # EARLIER
+            adj[a.a].add(a.b)
+            rev[a.b].add(a.a)
+    return adj, rev
+
+
+def _flood(seeds: Set[str], graph: Dict[str, Set[str]]) -> Set[str]:
+    """从种子集出发沿有向（或无向）图可到达的全部节点（种子自身计入，孤立也成立）。"""
+    seen: Set[str] = set()
+    stack = list(seeds)
+    while stack:
+        node = stack.pop()
+        if node in seen:
+            continue
+        seen.add(node)
+        for nxt in graph.get(node, ()):  # 同期边双向登记，无向传播自动成立
+            if nxt not in seen:
+                stack.append(nxt)
+    return seen
+
+
+def _assertion_arcs(a: Assertion) -> Tuple[Tuple[str, str], ...]:
+    """一条变更断言在混合图上贡献的有向弧：同期边无向（正反两弧），早于单向。"""
+    if a.relation == SAME:
+        return ((a.a, a.b), (a.b, a.a))
+    return ((a.a, a.b),)
+
+
+def _candidate_pairs(
+    strata: Sequence[str],
+    before_assertions: Sequence[Assertion],
+    after_assertions: Sequence[Assertion],
+) -> List[Tuple[str, str]]:
+    """依据提交前后生效断言，定位“可能改变关系结论或最优证据路径”的地层对。
+
+    锥集引理（候选不漏证）：设地层对 (x, y) 提交前后的关系结论或最优路径发生
+    变化，则其前/后混合图（同期边双向、早于边单向）上的 x -> y 或 y -> x 走法
+    集合必有差异（连通性翻转，或两侧都可达但最优走法换边）。取一侧存在、另一
+    侧不存在的某条走法 W，W 必含一条只在该侧生效的变更证据弧 (u, v)；沿 W 有
+    x -> u 与 v -> y，即 x ∈ Anc(u)（逆向可达）、y ∈ Desc(v)（正向可达）。
+    因此枚举每条变更证据弧、在**其存在的每一侧**取 Anc(u) × Desc(v)，必然覆盖
+    所有真正变化的对。
+
+    - 同一期合并 / 拆分：同期边按正反两弧处理，Anc/Desc 沿同期边无向扩散到
+      整个受影响等价类，跨类的“先/后序翻转或新增”再由先/后方向锥集补全；
+    - 早于路径改道：被撤回证据的旧锥集（旧侧）与新增证据的新锥集（新侧）
+      分别覆盖所有可能失去 / 获得走法的对；
+    - 实际变化确实很多（长链接入、整类合并）时候选对相应变大——允许工作量
+      随真实变化规模增长，但不再对全库逐对 Dijkstra。
+
+    返回按地层编号固定顺序（stratum_a < stratum_b）排序、去重后的候选对。
+    """
+    strata_set = set(strata)
+    if not strata_set:
+        return []
+
+    before_adj, before_rev = _mixed_graph(before_assertions)
+    after_adj, after_rev = _mixed_graph(after_assertions)
+
+    # 每条变更证据在每一侧贡献的弧（该侧生效才参与该侧锥集）
+    arcs_by_side: List[Set[Tuple[str, str]]] = [set(), set()]
+    for old, new in _changed_assertions(before_assertions, after_assertions):
+        if old is not None:
+            arcs_by_side[0].update(_assertion_arcs(old))
+        if new is not None:
+            arcs_by_side[1].update(_assertion_arcs(new))
+
+    side_graphs = ((before_adj, before_rev), (after_adj, after_rev))
+    candidates: Set[Tuple[str, str]] = set()
+    for side, (adj, rev) in enumerate(side_graphs):
+        arcs = arcs_by_side[side]
+        if not arcs:
+            continue  # 空侧（首个修订前）无生效弧
+        # 同一锥只遍历一次：大批汇入时多条变更弧常共享起点 / 终点
+        anc_cache: Dict[str, Set[str]] = {}
+        desc_cache: Dict[str, Set[str]] = {}
+        for u, v in arcs:
+            ancestors = anc_cache.get(u)
+            if ancestors is None:
+                ancestors = _flood({u}, rev)  # Anc(u)：能走到 u 的全部端点
+                anc_cache[u] = ancestors
+            descendants = desc_cache.get(v)
+            if descendants is None:
+                descendants = _flood({v}, adj)  # Desc(v)：从 v 能走到的全部端点
+                desc_cache[v] = descendants
+            for x in ancestors:
+                if x not in strata_set:
+                    continue
+                for y in descendants:
+                    if y not in strata_set or x == y:
+                        continue
+                    candidates.add((x, y) if x < y else (y, x))
+
+    return sorted(candidates)
+
+
 def relation_diffs(
     strata: Sequence[str],
     before_assertions: Sequence[Assertion],
     after_assertions: Sequence[Assertion],
 ) -> List[Dict[str, Any]]:
-    """纯函数：对固定地层集合，逐对比较提交前后关系结论与最优支撑路径。
+    """比较提交前后关系结论与最优支撑路径，只精算可能变化的地层对。
 
-    返回有序变化列表（按地层对固定顺序）；关系不变且路径不变的对不输出。
-    未定向路径用空列表表示。
+    候选对由 :func:`_candidate_pairs` 依据前/后生效断言定位（同期合并拆分、
+    早于路径改道的扩散全覆盖，证明见该函数）；未入候选的对其前/后走法集合
+    完全相同，关系结论与最优路径必然不变，无需逐对 Dijkstra。
+
+    返回有序变化列表（按地层对固定顺序，与全库逐对比较的口径一致）；
+    关系不变且路径不变的对不输出。未定向路径用空列表表示。
     """
     before = Derivation(before_assertions)
     after = Derivation(after_assertions)
-    ordered = sorted(strata)
     out: List[Dict[str, Any]] = []
-    for i, a in enumerate(ordered):
-        for b in ordered[i + 1 :]:
-            old_rel, old_path = before.relation(a, b)
-            new_rel, new_path = after.relation(a, b)
-            old_path = old_path or []
-            new_path = new_path or []
-            if old_rel != new_rel or old_path != new_path:
-                out.append(
-                    {
-                        "stratum_a": a,
-                        "stratum_b": b,
-                        "old_relation": old_rel,
-                        "new_relation": new_rel,
-                        "old_path": old_path,
-                        "new_path": new_path,
-                    }
-                )
+    for a, b in _candidate_pairs(strata, before_assertions, after_assertions):
+        old_rel, old_path = before.relation(a, b)
+        new_rel, new_path = after.relation(a, b)
+        old_path = old_path or []
+        new_path = new_path or []
+        if old_rel != new_rel or old_path != new_path:
+            out.append(
+                {
+                    "stratum_a": a,
+                    "stratum_b": b,
+                    "old_relation": old_rel,
+                    "new_relation": new_rel,
+                    "old_path": old_path,
+                    "new_path": new_path,
+                }
+            )
     return out
 
 
